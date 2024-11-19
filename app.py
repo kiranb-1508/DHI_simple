@@ -3,6 +3,8 @@ import torch
 from torchvision import transforms
 from PIL import Image
 import os
+from prometheus_client import Counter, generate_latest, REGISTRY
+from prometheus_client.exposition import basic_auth_handler
 
 # Initialize the Flask app
 app = Flask(__name__)
@@ -58,6 +60,10 @@ class WLeafNet(torch.nn.Module):
         x = self.fc(x)
         return x
 
+# Prometheus metrics
+image_classified_successfully = Counter('image_classified_successfully', 'Count of successful image classifications')
+image_classified_failed = Counter('image_classified_failed', 'Count of failed image classifications')
+
 # Load the trained model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = WLeafNet(num_classes=19)
@@ -103,46 +109,49 @@ class_mapping = {
 # Define the classification route
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
+    result = None  # Initialize result as None
     if request.method == 'POST':
-        # Check if a file was uploaded
+        # Handle file upload and classification logic
         file = request.files.get('file')
         if not file or file.filename == '':
-            return "No file uploaded or invalid file"
+            result = "No file uploaded or invalid file"
+        else:
+            # Save the uploaded image
+            upload_dir = 'uploads'
+            os.makedirs(upload_dir, exist_ok=True)
+            file_path = os.path.join(upload_dir, file.filename)
+            file.save(file_path)
 
-        # Save the uploaded image
-        upload_dir = 'uploads'
-        os.makedirs(upload_dir, exist_ok=True)
-        file_path = os.path.join(upload_dir, file.filename)
-        file.save(file_path)
+            try:
+                # Classify the image
+                image = Image.open(file_path).convert('RGB')
+                input_tensor = transform(image).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    outputs = model(input_tensor)
+                    _, predicted = outputs.max(1)
 
-        # Classify the image
-        try:
-            image = Image.open(file_path).convert('RGB')
-            input_tensor = transform(image).unsqueeze(0).to(device)
-            with torch.no_grad():
-                outputs = model(input_tensor)
-                _, predicted = outputs.max(1)
+                # Get the class name from the class mapping
+                predicted_class_index = predicted.item()
+                result = class_mapping.get(predicted_class_index, "Unknown class")
 
-            # Get the class name from the class mapping
-            predicted_class_index = predicted.item()
-            predicted_class = class_mapping.get(predicted_class_index, "Unknown class")
-            return f"Predicted Class: {predicted_class}"
-        except Exception as e:
-            return f"An error occurred: {e}"
-        finally:
-            # Cleanup uploaded file
-            if os.path.exists(file_path):
-                os.remove(file_path)
+                # Increment the successful classification counter
+                image_classified_successfully.inc()
+            except Exception as e:
+                # Increment the failed classification counter
+                image_classified_failed.inc()
+                result = f"An error occurred: {e}"
+            finally:
+                # Cleanup uploaded file
+                if os.path.exists(file_path):
+                    os.remove(file_path)
 
-    return '''
-    <!doctype html>
-    <title>Upload Image for Classification</title>
-    <h1>Upload an Image</h1>
-    <form method="post" enctype="multipart/form-data">
-      <input type="file" name="file">
-      <input type="submit" value="Upload">
-    </form>
-    '''
+    # Render the template with the result
+    return render_template('upload.html', result=result)
+
+# Prometheus metrics endpoint
+@app.route('/metrics')
+def metrics():
+    return generate_latest(REGISTRY)
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
